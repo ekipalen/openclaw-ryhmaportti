@@ -177,7 +177,7 @@ export default definePluginEntry({
       const state = `Recent group chat messages (oldest first). "${B}" is a bot member of a friends' group: mostly quiet, but like a friend it sometimes reacts with an emoji, drops a one-liner or a GIF.\n` +
         lines.join("\n") + (lines.length ? "\n" : "") + `[LATEST] ${senderLabel ?? "?"}: ${latest}`;
       const questions = {
-        addressed: { type: "noul", instructions: `Is the LATEST message meant for ${B} (the bot) to answer? Count it when the sender speaks to ${B} directly, explicitly hands the question to ${B} ('let's ask ${B}'), addresses all the agents or bots in the group as a group (${B} is one of them), or is clearly replying to or following up on what ${B} itself just said, even without naming it. Do not count merely mentioning or discussing ${B}, questions to other people about ${B}, or questions addressed to the humans.` },
+        addressed: { type: "noul", instructions: `Is the LATEST message meant for ${B} (the bot) to act on or answer? Count it when the sender speaks to ${B} directly, gives ${B} an instruction or request even if phrased in the third person ('${B} should note that...', '${B} writes this down', 'could ${B} list...'), explicitly hands the question to ${B} ('let's ask ${B}'), addresses all the agents or bots in the group as a group (${B} is one of them), or is clearly replying to or following up on what ${B} itself just said, even without naming it. Do not count statements or reports about ${B} that ask nothing of it, questions to other people about ${B}, or questions addressed to the humans.` },
         reply: {
           type: "choice",
           instructions: `What kind of reply from ${B} fits the LATEST message best?`,
