@@ -1,0 +1,21 @@
+{
+  "mode": "observe",
+  "groups": ["1234567890@g.us"],
+  "botName": "Botti",
+  "botMentions": ["1234567890"],
+  "ownerIds": ["+358401234567"],
+  "ownerName": "Alex",
+  "senderNames": { "+358401234567": "Alex", "+358407654321": "Sam" },
+  "botSenders": ["+358409999999"],
+  "blockMessage": "🚫 Ryhmäportti esti viestin.",
+  "gifEnabled": false,
+  "commentThreshold": 0.4,
+  "commentChance": 0.8,
+  "commentCooldownMin": 10,
+  "reactThreshold": 0.4,
+  "reactChance": 0.8,
+  "reactCooldownMin": 3,
+  "maxSpontaneousPerDay": 30,
+  "harmThreshold": 0.6,
+  "leakThreshold": 0.7
+}

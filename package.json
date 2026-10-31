@@ -1,0 +1,7 @@
+{
+  "name": "openclaw-ryhmaportti",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "OpenClaw-plugin: päätösmalli estää haitalliset ryhmäviestit ja päättää vastaako botti, kommentoi, reagoi vai on hiljaa",
+  "openclaw": { "extensions": ["./index.js"] }
+}
