@@ -204,7 +204,10 @@ export default definePluginEntry({
       const B = cfg.botName;
       const lines = contextLines(group);
       const paras = text.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean);
-      const units = paras.length >= 1 && paras.length <= 6 ? paras : [text];
+      // Enintään 12 yksikköä rinnakkain; pidemmässä tekstissä loppukappaleet yhdistetään viimeiseen.
+      // Ansa: koko teksti yhtenä yksikkönä pudottaa oikean sisällön selostavan alun mukana.
+      const units = paras.length <= 12 ? paras : [...paras.slice(0, 11), paras.slice(11).join("\n\n")];
+      if (!units.length) units.push(text);
       const one = async (draft) => {
         const r = await ask(
           `Recent group chat messages (oldest first). "${B}" is a bot member.\n${lines.join("\n")}\n\n${B}'s draft reply, about to be posted to the group:\n"""\n${draft}\n"""`,

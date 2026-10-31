@@ -50,3 +50,6 @@ show("7 oikea vastaus (odotus: undefined):", r);
 show("8a react #1 (odotus: undefined):", await run("before_tool_call", { toolName: "message", params: { action: "react", emoji: "🔥", messageId: "m1" } }, { runId: "run-2", sessionKey: `agent:main:whatsapp:group:${GROUP}` }));
 show("8b react #2 (odotus: params emoji 🔥):", await run("before_tool_call", { toolName: "message", params: { action: "react", emoji: "🙈", messageId: "m1" } }, { runId: "run-2", sessionKey: `agent:main:whatsapp:group:${GROUP}` }));
 console.log("\nloki:", join(dir, "decisions.jsonl"));
+// 9. Pitkä vastaus: selostava alku + oikea lista (odotus: selostus pois, lista jää)
+r = await run("reply_payload_sending", { payload: { text: "Sam pyytää listaamaan jäsenet. Vertaan listaa omaan muistiooni.\n\nOma listani on vanhentunut. Kirjoitan uuden.\n\n**Ihmiset:**\n\n- Alex\n- Sam\n- Kim\n\n**Botit:**\n\n- Botti (minä)\n- Apu-botti\n\nUusia jäseniä on tullut kaksi, vanhasta listasta puuttuu nimiä.\n\nHaluatko että päivitän listan?" }, kind: "final", runId: "run-2" }, { conversationId: GROUP });
+show("9 pitkä vastaus (odotus: lista jää):", r);
