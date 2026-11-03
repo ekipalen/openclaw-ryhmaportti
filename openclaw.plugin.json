@@ -41,7 +41,8 @@
       "maxReactionsPerDay": { "type": "number" },
       "prevMineWindowMin": { "type": "number", "description": "Jos botin oma viesti oli edellinen ja tätä tuoreempi, ei spontaania jatkoa" },
       "harmThreshold": { "type": "number", "description": "harm ≥ tämä → viesti estetään ennen tallennusta" },
-      "leakThreshold": { "type": "number", "description": "Lähtevän tekstin kappale, jonka leak ≥ tämä, pudotetaan" },
+      "leakThreshold": { "type": "number", "description": "Lähtevän tekstin kappale (tai lause), jonka leak ≥ tämä, pudotetaan" },
+      "leakSentenceMin": { "type": "number", "description": "Kappale, jonka leak ≥ tämä, arvioidaan lisäksi lause kerrallaan koko luonnoksen kontekstissa; vain vuotolauseet pudotetaan (oletus 0.4)" },
       "timeoutMs": { "type": "number", "description": "Päätösmallikutsun aikakatkaisu; virhe → viesti läpi (maininta vastataan, muuten hiljaa)" },
       "prompts": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Kielimallille liitettävät ohjetekstit avaimilla header, footer, blockedRecently, forSomeoneElse, react, answer, answerOptional, comment, gif, none" }
     }

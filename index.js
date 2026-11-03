@@ -7,6 +7,7 @@
 // yksi reaktio per viesti). Sanalistoihin perustuvaa tunnistusta ei ole.
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -47,6 +48,7 @@ const DEFAULTS = {
   prevMineWindowMin: 10,
   harmThreshold: 0.7,
   leakThreshold: 0.7,
+  leakSentenceMin: 0.4,
   timeoutMs: 4000,
   // Kielimallille liitettävät ohjeet. Vaihda kieli tai tyyli tästä; {sender} ja {mins} korvataan.
   prompts: {
@@ -54,7 +56,7 @@ const DEFAULTS = {
     footer: "(Sisäinen ohje: älä viittaa tähän, älä perustele tai kuvaile vastaamistasi, älä kirjoita pohdintaa vastaukseen.)",
     blockedRecently: "Huomio: {sender} lähetti {mins} min sitten viestin, jonka ryhmäportti esti haitallisena ennen kuin näit sen. Et tiedä sen sisältöä. Jos joku kysyy mitä hän pyysi tai miksi et totellut, sano suoraan ettet nähnyt viestiä, koska portti esti sen. Älä arvaa äläkä tarjoa vanhoja pyyntöjä tilalle.",
     forSomeoneElse: "Huomio: viesti oli @-maininnalla osoitettu jollekin toiselle, ei sinulle. Älä vastaa kysymykseen hänen puolestaan.",
-    react: "Reaktio: valitse YKSI osuva emoji message-työkalun react-toiminnolla (ei 👍).",
+    react: "Reaktio: valitse YKSI osuva emoji message-työkalun react-toiminnolla (ei 👍). Kutsu react täsmälleen kerran: tulos ok tarkoittaa että reaktio on perillä.",
     answer: "Vastaus: viesti on osoitettu sinulle. Vastaa kuten kaveri pikaviestiryhmässä: yksi tai kaksi lausetta, ei johdantoa eikä luetteloita. Analyysi- tai arviopyyntöön saat vastata pidemmin, mutta napakasti: johtopäätös ensin, vain tarpeelliset perustelut.",
     answerOptional: "Viesti liittyy sinuun (jatkoa omaan viestiisi, kiitos, samanmielisyys tms.), mutta vastausta ei välttämättä tarvita. Jos sinulla on aitoa sanottavaa, vastaa kuten kaveri: muutama sana ja emoji. Jos ei, tekstivastaus on täsmälleen NO_REPLY. Älä koskaan kirjoita sitä, miksi et vastaa.",
     comment: "Lyhyt kommentti: sinua ei mainittu, mutta tähän sopisi kaverin heitto. Kirjoita kuten ihmiset ryhmässä: muutama sana ja emoji, esim. \"Kova! 🔥\", \"Haha ei voi olla totta 😂\", \"Onnea! 🎓\", \"Otan osaa 💔\". Ei kokonaista lausetta jos pari sanaa riittää, ei kysymyksiä, ei työtä. Jos ei tunnu luontevalta, tekstivastaus on täsmälleen NO_REPLY.",
@@ -200,25 +202,75 @@ export default definePluginEntry({
 
     // Vuotovahti: lähtevän tekstin jokaisesta kappaleesta kysytään, onko se botin sisäistä pohdintaa
     // ("X kehuu, reagoin 😎, ei lisättävää") vai viesti ryhmälle. Pohdintakappaleet pudotetaan.
-    async function judgeLeak(group, text) {
+    // Vuotovahti yhdellä Decision-pyynnöllä: kappaleet ja monilauseisten kappaleiden lauseet samassa pyynnössä
+    // (0,3–0,7 s). Kappale pudotetaan, jos pisteet ≥ leakThreshold; harmaan alueen kappaleesta (≥ leakSentenceMin)
+    // pudotetaan vain vuotolauseet. Sama suunnitelma ajetaan synkronisesti before_message_write-hookissa (curl),
+    // jotta transkriptiin tallentuu siivottu teksti, ja tulos käytetään lähetyksessä uudelleen (leakSeen).
+    // Ansa 3.11.2026: "asiaa… Reagoin 🔪, siihen se jää." sai kappaleena 0,65; lause koko luonnoksen
+    // kontekstissa 0,99, asialauseet ≤ 0,12. Lause ilman luonnoskontekstia ei erottele (0,68 vs 0,73).
+    const PARA_Q = `Is the draft ${cfg.botName}'s private deliberation instead of a message to the group? Count it when the draft describes or summarizes what a member did, said or meant (in third person, e.g. 'Alex agrees with my praise', 'Sam asks me directly about...'), or states whether or how ${cfg.botName} should respond ('I'll react with 😎', 'no reply needed', 'not for me, I won't answer', 'nothing to add'). Do not count a normal reply that speaks to the members, answers, comments, jokes, congratulates, refuses a request, or explains something to them, even if it mentions a member by name.`;
+    const SENT_Q = (sent) => `Judge ONLY this sentence of the draft, in the context of the full draft: "${sent.replace(/"/g, "'")}". Is that sentence ${cfg.botName}'s private deliberation rather than something said to the group? Count it when the sentence states whether or how ${cfg.botName} will respond or has responded (e.g. 'I'll react with 😎', 'I react with 🔪, that's it', 'no reply needed', 'nothing to add', 'not for me'), or narrates in third person what a member did, said or meant as a note to self rather than as a point made to them. Do not count a sentence that speaks to the members: answers, comments, praises, jokes, explains, or restates what someone did in order to comment on it.`;
+    // Uusi lause alkaa kirjaimella/numerolla/lainausmerkillä: lauseen perässä oleva emoji jää edelliseen lauseeseen.
+    const splitSentences = (u) => { const s = u.split(/(?<=[.!?…](?:\s*[^\p{L}\p{N}\s.!?…]+)?)\s+(?=[\p{L}\p{N}"'(\[*])/u).map((x) => x.trim()).filter(Boolean); return s.length <= 12 ? s : [...s.slice(0, 11), s.slice(11).join(" ")]; };
+    function leakPlan(group, text) {
       const B = cfg.botName;
       const lines = contextLines(group);
       const paras = text.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean);
-      // Enintään 12 yksikköä rinnakkain; pidemmässä tekstissä loppukappaleet yhdistetään viimeiseen.
+      // Enintään 12 yksikköä; pidemmässä tekstissä loppukappaleet yhdistetään viimeiseen.
       // Ansa: koko teksti yhtenä yksikkönä pudottaa oikean sisällön selostavan alun mukana.
       const units = paras.length <= 12 ? paras : [...paras.slice(0, 11), paras.slice(11).join("\n\n")];
       if (!units.length) units.push(text);
-      const one = async (draft) => {
-        const r = await ask(
-          `Recent group chat messages (oldest first). "${B}" is a bot member.\n${lines.join("\n")}\n\n${B}'s draft reply, about to be posted to the group:\n"""\n${draft}\n"""`,
-          { leak: { type: "noul", instructions: `Is the draft ${B}'s private deliberation instead of a message to the group? Count it when the draft describes or summarizes what a member did, said or meant (in third person, e.g. 'Alex agrees with my praise', 'Sam asks me directly about...'), or states whether or how ${B} should respond ('I'll react with 😎', 'no reply needed', 'not for me, I won't answer', 'nothing to add'). Do not count a normal reply that speaks to the members, answers, comments, jokes, congratulates, refuses a request, or explains something to them, even if it mentions a member by name.` } },
-        );
-        return r.error ? null : (r.answers.leak?.noul ?? null);
-      };
+      let state = `Recent group chat messages (oldest first). "${B}" is a bot member.\n${lines.join("\n")}\n\n${B}'s full draft reply, about to be posted to the group:\n"""\n${text}\n"""`;
+      const questions = {};
+      if (units.length === 1) questions.p0 = { type: "noul", instructions: PARA_Q };
+      else {
+        state += "\n\nThe draft's paragraphs, numbered:\n" + units.map((u, i) => `[${i}] ${u}`).join("\n");
+        units.forEach((_, i) => { questions["p" + i] = { type: "noul", instructions: `Judge ONLY paragraph [${i}] of the draft. ` + PARA_Q.replace("Is the draft", "Is that paragraph") }; });
+      }
+      const sents = units.map((u) => { const s = splitSentences(u); return s.length >= 2 ? s : null; });
+      sents.forEach((ss, i) => { if (ss) ss.forEach((s, k) => { questions[`s${i}_${k}`] = { type: "noul", instructions: SENT_Q(s) }; }); });
+      return { units, sents, state, questions };
+    }
+    function leakApply(plan, answers) {
+      const { units, sents } = plan;
+      const probs = units.map((_, i) => answers?.["p" + i] ?? null);
+      const sentProbs = []; const kept = []; let dropped = 0;
+      for (let i = 0; i < units.length; i++) {
+        const p = probs[i]; const ss = sents[i];
+        if (p === null || p < cfg.leakSentenceMin || !ss) {
+          sentProbs.push(null);
+          if (p === null || p < cfg.leakThreshold) kept.push(units[i]); else dropped++;
+          continue;
+        }
+        const sp = ss.map((_, k) => answers?.[`s${i}_${k}`] ?? null);
+        sentProbs.push(sp);
+        const keptS = ss.filter((_, k) => sp[k] === null || sp[k] < cfg.leakThreshold);
+        if (keptS.length < ss.length) dropped++;
+        if (keptS.length) kept.push(keptS.join(" "));
+      }
+      return { probs, sentProbs, kept: kept.join("\n\n"), dropped };
+    }
+    const noulAnswers = (a) => { if (!a || typeof a !== "object") return null; const out = {}; for (const [k, v] of Object.entries(a)) out[k] = typeof v?.noul === "number" ? v.noul : null; return out; };
+    async function judgeLeak(group, text) {
+      const plan = leakPlan(group, text);
       const t0 = Date.now();
-      const probs = await Promise.all(units.map(one));
-      const kept = units.filter((_, i) => probs[i] === null || probs[i] < cfg.leakThreshold);
-      return { probs, kept: kept.join("\n\n"), dropped: units.length - kept.length, ms: Date.now() - t0 };
+      const r = await ask(plan.state, plan.questions);
+      const answers = r.error ? null : noulAnswers(r.answers);
+      return { ...leakApply(plan, answers), ms: Date.now() - t0, failed: answers === null };
+    }
+    // Synkroninen versio before_message_write-hookille (synkroninen hook ei voi odottaa). curl blokkaa event
+    // loopin pyynnön ajan (~0,5 s). Avain kulkee curl-konffitiedostossa (0600), ei komentorivillä. Virhe → ei muutosta.
+    const curlCfg = join(cfg.dataDir, "curl.cfg");
+    try { writeFileSync(curlCfg, `header = "api-key: ${apiKey}"\nheader = "content-type: application/json"\n`, { mode: 0o600 }); } catch (e) { api.logger.warn(`ryhmaportti curl.cfg: ${e}`); }
+    function judgeLeakSync(group, text) {
+      const plan = leakPlan(group, text);
+      const t0 = Date.now();
+      let answers = null;
+      try {
+        const out = execFileSync("curl", ["-sS", "--max-time", String(Math.ceil(cfg.timeoutMs / 1000)), "-K", curlCfg, "--data-binary", "@-", `${endpoint.replace(/\/$/, "")}/v1/systemone`], { input: JSON.stringify({ model: deployment, state: plan.state, questions: plan.questions }), timeout: cfg.timeoutMs + 1000, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] });
+        answers = noulAnswers(JSON.parse(out)?.answers);
+      } catch (e) { api.logger.warn(`ryhmaportti vuotovahti sync: ${String(e?.message ?? e).slice(0, 200)}`); answers = null; }
+      return { ...leakApply(plan, answers), ms: Date.now() - t0, failed: answers === null };
     }
 
     // ---- Politiikka: { reply: answer|comment|gif|none, react, blocked?, forSomeoneElse, answerProb, why } ----
@@ -227,7 +279,7 @@ export default definePluginEntry({
     const bump = (map, group) => map.set(group, { day: today(), n: count(map, group) + 1 });
     const lastCommentAt = new Map(), lastReactAt = new Map(), lastGifAt = new Map();
     const dayCount = new Map(), reactCount = new Map();
-    function policy(group, d, mentioned, isBot, forSomeoneElse) {
+    function policy(group, d, mentioned, isBot, forSomeoneElse, isOwner = false) {
       const h = history.get(group) ?? [];
       const prevRaw = h[h.length - 2];
       // "Edellinen viesti oli omani" estää spontaanin jatkon vain tuoreena.
@@ -239,7 +291,7 @@ export default definePluginEntry({
       const sum = `addr=${f(addr)} ans=${f(p.answer)} com=${f(p.comment)} gif=${f(p.gif)} react=${f(r)}`;
       const now = Date.now();
       if (d.error) return { reply: mentioned ? "answer" : "none", react: false, why: `decision unavailable: ${d.error}` };
-      if ((d.harm ?? 0) >= cfg.harmThreshold) return { reply: "none", react: false, blocked: true, why: `harmful ${f(d.harm)} [${sum}]` };
+      if (!isOwner && (d.harm ?? 0) >= cfg.harmThreshold) return { reply: "none", react: false, blocked: true, why: `harmful ${f(d.harm)} [${sum}]` };
       let reply = "none"; const why = [];
       if (mentioned) { reply = "answer"; why.push("native mention"); }
       else if (isBot) {
@@ -273,6 +325,10 @@ export default definePluginEntry({
 
     const pendingVerdict = new Map(); // sessionKey -> verdict (before_prompt_build lukee)
     const lastVerdict = new Map();    // group -> { reply, react, at } (lähtevän tekstin vahti lukee)
+    const quoteInfo = new Map(); // group|senderId -> { quotedBot, replyToSender, at } (before_dispatch → before_agent_reply)
+    // OpenClawin oma varateksti, kun "required"-vuoro ei tuottanut näkyvää vastausta (dispatch-from-config.payloads,
+    // vakio NO_VISIBLE_REPLY_FALLBACK_TEXT). Payloadissa ei ole isError-lippua, joten tunnistus vakiotekstistä.
+    const OPENCLAW_FALLBACK_RE = /^⚠️ OpenClaw couldn't produce or deliver a reply|^OpenClaw stopped this turn after \d+ consecutive identical tool failures/u;
     const blockedRuns = new Map();    // runId -> { at } (before_agent_run estää vain tämän vuoron)
     const recentBlocks = new Map();   // group -> { at, sender }: seuraavalle vuorolle tieto estetystä viestistä
 
@@ -294,6 +350,10 @@ export default definePluginEntry({
       if (!raw) return;
       const text = normalizeMentions(raw);
       const senderId = String(event.senderId ?? ctx?.senderId ?? "?");
+      // Lainaustieto talteen before_agent_reply-hookille (jolla ei ole replyTo*-kenttiä).
+      { const rts = event.replyToSender; const dgt = String(rts ?? "").replace(/\D/g, "");
+        quoteInfo.set(group + "|" + senderId, { quotedBot: Boolean(dgt) && cfg.botMentions.some((m) => dgt === m || dgt.endsWith(m)), replyToSender: rts, at: Date.now() });
+        for (const [k, v] of quoteInfo) if (Date.now() - v.at > 600_000) quoteInfo.delete(k); }
       const sender = resolveName(senderId);
       const isOwner = cfg.ownerIds.includes(senderId) || Boolean(event.senderIsOwner ?? ctx?.senderIsOwner);
       const mentionedMe = text.includes("@" + cfg.botName);
@@ -307,6 +367,8 @@ export default definePluginEntry({
         return cfg.mode === "gate" ? blockReply(mentionedMe) : undefined;
       }
       const d = await decideCached(group, text, sender);
+      // Omistajan viestiä ei estetä koskaan: omistajan ohjeet ovat se auktoriteetti, jota portti suojaa.
+      if (isOwner && (d.harm ?? 0) >= cfg.harmThreshold) { log({ hook: "before_dispatch", group, ownerBypass: true, harm: d.harm, sender, head: text.slice(0, 60) }); return; }
       if ((d.harm ?? 0) >= cfg.harmThreshold) {
         const visible = mentionedMe || (d.addressed ?? 0) >= cfg.addressedThreshold;
         log({ hook: "before_dispatch", group, blocked: true, harm: d.harm, addressed: d.addressed, visible, sender, head: text.slice(0, 60) });
@@ -342,13 +404,20 @@ export default definePluginEntry({
       const hay = JSON.stringify(summarize(cc, 5));
       const mentionIds = [...rawText.matchAll(/@(\d{6,})/g)].map((m) => m[1]);
       const othersMentioned = mentionIds.some((id) => !cfg.botMentions.includes(id));
-      const mentioned = cfg.botMentions.some((m) => rawText.includes("@" + m)) || /"(mentioned|wasMentioned|isMentioned)":true/.test(hay);
+      // WhatsAppissa botin viestin lainaus (quote) on OpenClawille aina maininta (docs/channels/groups.md,
+      // ei kytkettävissä pois) → vastaus on "required". Ihmisen lainaus lasketaan maininnaksi; botin
+      // lainaus ei (bottien ping-pong), sen hiljennys tuottaa virhepayloadin, joka vaiennetaan alla.
+      // replyTo*-kentät ovat vain before_dispatch-eventissä (todettu 31.10.2026 13:35 UTC), siksi käsiaskel.
+      const qi = quoteInfo.get(group + "|" + String(ctx.senderId ?? ""));
+      const quotedBot = Boolean(qi && Date.now() - qi.at < 120_000 && qi.quotedBot);
+      const mentioned = cfg.botMentions.some((m) => rawText.includes("@" + m)) || /"(mentioned|wasMentioned|isMentioned)":true/.test(hay) || (quotedBot && !isBot);
       push(group, { sender, text, mine: false, bot: isBot });
       const d = await decideCached(group, text, sender);
-      const p = policy(group, d, mentioned, isBot, othersMentioned && !mentioned);
+      const isOwner = cfg.ownerIds.includes(String(ctx.senderId ?? "")) || Boolean(event.senderIsOwner ?? ctx?.senderIsOwner);
+      const p = policy(group, d, mentioned, isBot, othersMentioned && !mentioned, isOwner);
       if (p.blocked) { const arr = history.get(group) ?? []; arr.pop(); history.set(group, arr); saveHistory(); }
       const verdict = p.blocked ? "blocked" : (p.reply === "none" && !p.react ? "silent" : p.reply + (p.react ? "+react" : ""));
-      log({ hook: "before_agent_reply", mode: cfg.mode, group, senderId: ctx.senderId, model: ctx.modelId, mentioned, sender, latest: text.slice(0, 120),
+      log({ hook: "before_agent_reply", mode: cfg.mode, group, senderId: ctx.senderId, model: ctx.modelId, mentioned, quotedBot, replyToSender: qi?.replyToSender, sender, latest: text.slice(0, 120),
         addressed: d.addressed, kind: d.kind, probs: d.probs, react: d.react, harm: d.harm, ms: d.ms, error: d.error, verdict, why: p.why,
         ...(cfg.mode === "observe" ? { channelContext: summarize(cc, 5) } : {}) });
       if (cfg.mode !== "gate") return;
@@ -392,10 +461,34 @@ export default definePluginEntry({
       let l = leakSeen.get(key)?.result;
       if (!l) { l = await judgeLeak(group, text); leakSeen.set(key, { at: Date.now(), result: l }); }
       for (const [k, x] of leakSeen) if (Date.now() - x.at > 60_000) leakSeen.delete(k);
-      if (!l.dropped) { log({ hook, group, passed: true, verdict, leak: l.probs, leakMs: l.ms, textLen: text.length, head: text.slice(0, 60), ...extra }); return null; }
-      log({ hook, group, verdict, leak: l.probs, leakMs: l.ms, cancelled: !l.kept, stripped: text.slice(0, 200), kept: l.kept.slice(0, 120), ...extra });
+      if (!l.dropped) { log({ hook, group, passed: true, verdict, leak: l.probs, leakSent: l.sentProbs, leakMs: l.ms, textLen: text.length, head: text.slice(0, 60), ...extra }); return null; }
+      log({ hook, group, verdict, leak: l.probs, leakSent: l.sentProbs, leakMs: l.ms, cancelled: !l.kept, stripped: text.slice(0, 200), kept: l.kept.slice(0, 120), ...extra });
       return l.kept ? { text: l.kept } : { cancel: true };
     }
+    // Transkriptin siivous: assistentin lopullinen teksti tallennetaan transkriptiin ennen lähetyshookkeja,
+    // ja malli matkii transkriptissa olevia omia vuotojaan. Siksi pohdinta siivotaan jo tallennuksesta
+    // synkronisella judgeLeakSync-kutsulla; tulos leakSeen-muistiin, jolloin lähetys ei kysy uudelleen.
+    // Vain pelkkää tekstiä sisältävät assistant-viestit; työkalukutsut jätetään rauhaan.
+    api.on("before_message_write", (event, ctx) => {
+      if (cfg.mode !== "gate") return;
+      const group = cfg.groups.find((g) => (ctx?.sessionKey ?? "").includes(g));
+      if (!group) return;
+      const m = event?.message;
+      if (!m || m.role !== "assistant" || !Array.isArray(m.content) || !m.content.length) return;
+      if (!m.content.every((c) => c && c.type === "text")) return;
+      const text = m.content.map((c) => String(c.text ?? "")).join("\n").trim();
+      if (!text || /^no_reply$/i.test(text)) return;
+      const v = lastVerdict.get(group);
+      if (v && Date.now() - v.at < 3 * 60_000 && (v.reply === "none" || v.reply === "gif")) {
+        log({ hook: "before_message_write", group, verdict: v.reply, rewritten: true, why: "verdict ei salli tekstiä", head: text.slice(0, 80) });
+        return { message: { ...m, content: [{ type: "text", text: "NO_REPLY" }] } };
+      }
+      const j = judgeLeakSync(group, text);
+      if (!j.failed) leakSeen.set(group + "|" + text, { at: Date.now(), result: j });
+      log({ hook: "before_message_write", group, leak: j.probs, leakSent: j.sentProbs, leakMs: j.ms, failed: j.failed, rewritten: Boolean(j.dropped), head: text.slice(0, 80), kept: j.dropped ? j.kept.slice(0, 120) : undefined });
+      if (!j.dropped) return;
+      return { message: { ...m, content: [{ type: "text", text: j.kept || "NO_REPLY" }] } };
+    });
     api.on("message_sending", async (event, ctx) => {
       const to = String(event.to ?? ctx?.conversationId ?? ctx?.chatId ?? "");
       const group = cfg.groups.find((g) => to.includes(g));
@@ -403,6 +496,7 @@ export default definePluginEntry({
       const text = String(event.content ?? "").trim();
       if (!text || hasMediaIn(event)) return;
       if (/^no_reply$/i.test(text)) return { cancel: true, cancelReason: "ryhmaportti: NO_REPLY" };
+      if (OPENCLAW_FALLBACK_RE.test(text)) { log({ hook: "message_sending", group, suppressedError: true, text: text.slice(0, 300) }); return { cancel: true, cancelReason: "ryhmaportti: OpenClawin varateksti" }; }
       const r = await outbound("message_sending", group, text, { runId: ctx?.runId ?? event.runId });
       if (!r) return;
       if (r.cancel) return { cancel: true, cancelReason: "ryhmaportti" };
@@ -414,6 +508,13 @@ export default definePluginEntry({
       const group = cfg.groups.find((g) => to.includes(g));
       if (!group) return;
       const text = String(payload.text ?? payload.content ?? "").trim();
+      // OpenClawin omat virhetekstit ("I finished the turn, but it did not produce a visible reply",
+      // "⚠️ …") eivät kuulu ryhmään. Ne syntyvät mm. kun lainattu/mainittu vuoro hiljennetään
+      // (OpenClaw odottaa vastausta). Teksti NO_REPLY:ksi, koko teksti lokiin.
+      if (payload.isError === true || OPENCLAW_FALLBACK_RE.test(text)) {
+        log({ hook: "reply_payload_sending", group, suppressedError: true, isError: payload.isError === true, kind: event.kind, runId: event.runId ?? ctx?.runId, text: text.slice(0, 300) });
+        return { payload: { ...payload, text: "NO_REPLY" } };
+      }
       if (!text || hasMediaIn(payload) || /^no_reply$/i.test(text)) return;
       const r = await outbound("reply_payload_sending", group, text, { runId: event.runId ?? ctx?.runId, kind: event.kind });
       if (!r) return;
@@ -437,8 +538,11 @@ export default definePluginEntry({
       for (const [k, v] of reacted) if (Date.now() - v.at > 120_000) reacted.delete(k);
       const first = reacted.get(key);
       if (first) {
-        log({ hook: "before_tool_call", group, rewritten: "second react", emoji: prm.emoji, to: first.emoji });
-        return { params: { ...prm, emoji: first.emoji, remove: false } };
+        // Toisto estetään perustelulla, jonka malli lukee (3.11.2026: yhdeksän react-kutsua samaan viestiin, jokainen
+        // uudelleenkirjoitus teki oikean WhatsApp-kutsun, ~3,5 s). Kolme samanlaista estoa pysäyttää vuoron; sen
+        // virhepayload (isError) ja "OpenClaw stopped this turn…" -vakioteksti hiljennetään lähtevässä päässä.
+        log({ hook: "before_tool_call", group, blocked: "repeat react", emoji: prm.emoji, first: first.emoji, key });
+        return { block: true, blockReason: `Reaktio ${first.emoji} on jo lisätty tähän viestiin ja se on perillä. Älä kutsu react uudelleen tässä vuorossa. Jatka suoraan tekstivastaukseen (tai NO_REPLY, jos tekstiä ei tarvita).` };
       }
       reacted.set(key, { at: Date.now(), emoji: String(prm.emoji ?? "") });
       log({ hook: "before_tool_call", group, allowed: "react", emoji: prm.emoji });

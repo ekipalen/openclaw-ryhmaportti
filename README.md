@@ -7,7 +7,7 @@ asetusten muuttamisyrityksiä.
 
 > **Tila: esimerkiksi tehty, testaamaton geneerinen kopio.** Tämä on siivottu kopio pluginista, joka on
 > tuotantokäytössä yhdessä WhatsApp-ryhmässä. Siivottua versiota ei ole ajettu OpenClaw-gatewayssa;
-> `node smoke-test.mjs` ajaa hookit väärennetyllä api-oliolla oikeaa päätösmallia vasten (menee läpi).
+> `node smoke-test.mjs` ajaa hookit väärennetyllä api-oliolla oikeaa päätösmallia vasten (menee läpi). Vaatii `curl`in.
 > Lue koodi, aja ensin `mode: "observe"` ja säädä kynnykset lokin perusteella.
 
 ## Mitä se tekee
@@ -21,7 +21,9 @@ yksi reaktio per viesti).
    tai ohittamaan omistajan ohjeet. Kynnyksen ylittävä viesti otetaan haltuun
    `before_dispatch`-hookissa, jolloin se **ei päädy transkriptiin eikä kielimallille**. Jos viesti
    oli botille osoitettu, ryhmään menee `blockMessage`; muille osoitetut estetään hiljaa.
-   `/komento` muulta kuin omistajalta estetään aina ilman päätösmallia.
+   `/komento` muulta kuin omistajalta estetään aina ilman päätösmallia. Omistajan (`ownerIds`) omaa
+   viestiä ei estetä koskaan: päätösmalli pitää helposti "tulosta jäsenlista / näytä lokit" -pyyntöä
+   urkintana, eikä omistajaa vastaan ole mitään suojattavaa.
 2. **Vastaamispäätös.** Kysymykset `addressed` (onko viesti botille), `reply`
    (answer / comment / gif / none) ja `react` (reagoisiko kaveri emojilla). Politiikka yhdistää ne
    kynnyksiin, kolikonheittoon, jäähdytyksiin ja päiväkattoihin → verdict, esimerkiksi
@@ -120,15 +122,38 @@ uudelleen, mikä katkaisee WhatsApp-yhteyden noin puoleksi minuutiksi.
 - **Lopullista vastausta ei saa perua (`cancel`) `reply_payload_sending`-hookissa:** OpenClaw
   lähettää tilalle "⚠️ couldn't produce or deliver a reply". Teksti `NO_REPLY` hiljennetään
   toimituskerroksessa ilman varoitusta, joten vahti kirjoittaa tekstin siksi.
-- **Toista reaktiota ei saa estää `block`illa:** estetty työkalukutsu on virhe, ja kolme
-  samanlaista virhettä peräkkäin pysäyttää vuoron näkyvällä virheviestillä. Siksi toisen
-  react-kutsun emoji kirjoitetaan ensimmäiseksi.
+- **Kielimalli kutsuu `react`iä samaan viestiin yhä uudelleen** vaikka tulos on joka kerta `ok`
+  (pahimmillaan yhdeksän kutsua, jokainen oikea kanavakutsu). Toisen kutsun uudelleenkirjoitus
+  ensimmäiseksi emojiksi ei pysäytä silmukkaa. Siksi toisto estetään `block`illa ja perustelulla,
+  jonka malli lukee. Estetty kutsu on työkaluvirhe: kolme samanlaista peräkkäin pysäyttää vuoron,
+  ja OpenClaw lähettää silloin virhepayloadin (`isError`) sekä vakiotekstin "OpenClaw stopped this
+  turn after N consecutive identical tool failures"; molemmat hiljennetään lähtevässä päässä.
+- **Vuotovahti kappaleittain ei riitä** kun pohdinta on yhden kappaleen viimeinen lause
+  ("…asiaa. Reagoin 🔪, siihen se jää." sai kappaleena 0,65). Harmaan alueen kappale
+  (`leakSentenceMin`) arvioidaan lause kerrallaan koko luonnoksen kontekstissa; ilman kontekstia
+  lausepisteet eivät erottele. Kaikki kysytään yhdellä pyynnöllä (kappaleet + lauseet).
+- **Transkriptiin jää alkuperäinen teksti** vaikka lähetys siivottaisiin, ja malli matkii omia vanhoja
+  vuotojaan seuraavilla vuoroilla. Assistentin viesti tallennetaan ennen `before_agent_finalize`a ja
+  lähetyshookkeja, joten ainoa paikka on synkroninen `before_message_write`. Se ei voi odottaa `fetch`iä,
+  joten sama päätöspyyntö ajetaan `curl`illa (`execFileSync`, avain `curl.cfg`-tiedostossa datahakemistossa)
+  ja tulos käytetään lähetyksessä uudelleen. Event loop blokkaa noin puoli sekuntia per vastaus.
+- **`openclaw plugins reload` on raskas:** se pysäyttää muitakin plugin-palveluita (memory-core), kestää
+  noin kaksi minuuttia ja voi katkaista kanavayhteyden. Jos reload osuu kesken ajon, lähetyshookit
+  epäonnistuvat ja viesti lähtee ilman vahtia. Lataa uudelleen vain kun ryhmä on hiljaa.
 - **Tuntematon konffiavain estää kaikki hot reloadit** kunnes se on poistettu. Lisää avain
   manifestiin ja lataa plugin uudelleen ennen kuin käytät sitä konffissa.
 - **`message_received` ei laukea WhatsApp-ryhmäviesteistä**; kontekstipuskuri rakennetaan
   `before_agent_reply`-hookissa ja omat viestit `message_sent`-hookissa.
 - **OpenClawin sisäinen "Background skill review" -vuoro** tulee hookille viimeisen lähettäjän
   tiedoilla; se vaiennetaan ryhmäsessiossa ilman päätösmallia.
+- **Botin viestin lainaus on WhatsAppissa maininta, jota ei voi kytkeä pois** (OpenClawin
+  `docs/channels/groups.md`). OpenClaw odottaa silloin vastausta, ja hiljennetty vuoro tuottaa
+  ryhmään tekstin "I finished the turn, but it did not produce a visible reply". Siksi
+  `reply_payload_sending` muuttaa kaikki `isError`-payloadit `NO_REPLY`:ksi ja lokittaa tekstin;
+  ihmisen tekemä lainaus lasketaan lisäksi maininnaksi, botin lainaus ei (ping-pong). Lainaustieto
+  (`replyToSender`) on vain `before_dispatch`-eventissä, ei `before_agent_reply`ssa, joten se viedään
+  mapilla. OpenClaw lähettää virhepayloadin perään vielä varatekstin "⚠️ OpenClaw couldn't produce or
+  deliver a reply" ilman mitään lippua; se tunnistetaan OpenClawin vakiotekstistä ja hiljennetään.
 - Kielimalli voi kirjoittaa päättelynsä vastaukseksi, vaikka ohje kieltää. Siksi vuotovahti on
   tekstissä, ei ohjeessa.
 

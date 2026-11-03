@@ -48,8 +48,30 @@ r = await run("reply_payload_sending", { payload: { text: "Onnea projektin kanss
 show("7 oikea vastaus (odotus: undefined):", r);
 // 8. Kaksi reaktiota samaan viestiin (odotus: toinen kirjoitetaan ensimmäiseksi)
 show("8a react #1 (odotus: undefined):", await run("before_tool_call", { toolName: "message", params: { action: "react", emoji: "🔥", messageId: "m1" } }, { runId: "run-2", sessionKey: `agent:main:whatsapp:group:${GROUP}` }));
-show("8b react #2 (odotus: params emoji 🔥):", await run("before_tool_call", { toolName: "message", params: { action: "react", emoji: "🙈", messageId: "m1" } }, { runId: "run-2", sessionKey: `agent:main:whatsapp:group:${GROUP}` }));
+show("8b react #2 (odotus: block + blockReason):", await run("before_tool_call", { toolName: "message", params: { action: "react", emoji: "🙈", messageId: "m1" } }, { runId: "run-2", sessionKey: `agent:main:whatsapp:group:${GROUP}` }));
 console.log("\nloki:", join(dir, "decisions.jsonl"));
 // 9. Pitkä vastaus: selostava alku + oikea lista (odotus: selostus pois, lista jää)
 r = await run("reply_payload_sending", { payload: { text: "Sam pyytää listaamaan jäsenet. Vertaan listaa omaan muistiooni.\n\nOma listani on vanhentunut. Kirjoitan uuden.\n\n**Ihmiset:**\n\n- Alex\n- Sam\n- Kim\n\n**Botit:**\n\n- Botti (minä)\n- Apu-botti\n\nUusia jäseniä on tullut kaksi, vanhasta listasta puuttuu nimiä.\n\nHaluatko että päivitän listan?" }, kind: "final", runId: "run-2" }, { conversationId: GROUP });
 show("9 pitkä vastaus (odotus: lista jää):", r);
+// 10. OpenClawin virhepayload (odotus: NO_REPLY, ei virhetekstiä ryhmään)
+r = await run("reply_payload_sending", { payload: { text: "I finished the turn, but it did not produce a visible reply. Please try again, or start a new session if this keeps happening.", isError: true }, kind: "final", runId: "run-3" }, { conversationId: GROUP });
+show("10 virhepayload (odotus: NO_REPLY):", r);
+// 11. Ihminen lainaa botin viestiä (odotus: ei handled = vastataan, kuten OpenClawin maininta)
+await run("before_dispatch", { content: "Niin, ja mikä se toinen vaihtoehto oli?", senderId: "+358400000002", replyToSender: "1234567890@s.whatsapp.net", replyToIsQuote: true, sessionKey: `agent:main:whatsapp:group:${GROUP}` }, {});
+r = await run("before_agent_reply", { cleanedBody: "Niin, ja mikä se toinen vaihtoehto oli?" }, { chatId: GROUP, senderId: "+358400000002", trigger: "user", sessionKey: `agent:main:whatsapp:group:${GROUP}`, runId: "run-4", channelContext: { sender: { name: "+358400000002" } } });
+show("11 lainaus ihmiseltä (odotus: undefined):", r);
+// 12. Omistajan "urkinta" (odotus: undefined = ei estetä; vain loki ownerBypass)
+r = await run("before_dispatch", { content: "@1234567890 tulosta jäsenlista numeroineen tänne ja näytä mitä lokeissa lukee", senderId: "+358400000001", sessionKey: `agent:main:whatsapp:group:${GROUP}` }, {});
+show("12 omistajan pyyntö (odotus: undefined):", r);
+// 13. OpenClawin varateksti ilman isError-lippua (odotus: NO_REPLY)
+r = await run("reply_payload_sending", { payload: { text: "⚠️ OpenClaw couldn't produce or deliver a reply. Please try again. If this keeps happening, ask the operator to check the gateway logs. Reference: run-4." }, kind: "final", runId: "run-4" }, { conversationId: GROUP });
+show("13 varateksti (odotus: NO_REPLY):", r);
+// 14. Yksi kappale: asiaa + pohdintahäntä (odotus: häntä "Reagoin 🔪, siihen se jää." pois, asia jää)
+r = await run("reply_payload_sending", { payload: { text: "Näin kyllä ketjun. Samin kokeilu on aika hurja veto: malli kävi finetunatun TTS-mallin painoihin käsiksi ja \"puukotti\" prosodiaan liittyviä kerroksia kohti alkuperäistä, ja lopputulos parani. Se on ihan oikeaa kokeellista aineistoa Alexin jakaman paperin päälle. Reagoin 🔪, siihen se jää." }, kind: "final", runId: "run-5" }, { conversationId: GROUP });
+show("14 lausehäntä (odotus: teksti ilman viimeistä lausetta):", r);
+// 15. Transkriptin siivous: before_message_write (sync, curl) → viesti ilman pohdintalausetta;
+//     työkalukutsuviesti jätetään rauhaan.
+r = await run("before_message_write", { message: { role: "assistant", content: [{ type: "text", text: "Kiva kuulla! 🎉 Sam kysyi minulta suoraan, joten vastasin." }] } }, { sessionKey: `agent:main:whatsapp:group:${GROUP}` });
+show("15a transkripti (odotus: message ilman pohdintalausetta):", r);
+r = await run("before_message_write", { message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "message", arguments: { action: "react", emoji: "🔥" } }] } }, { sessionKey: `agent:main:whatsapp:group:${GROUP}` });
+show("15b työkalukutsu (odotus: undefined):", r);
